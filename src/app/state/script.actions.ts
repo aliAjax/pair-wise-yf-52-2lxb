@@ -8,3 +8,6 @@ export const reorderLines = createAction('[Script] Reorder Lines', props<{ from:
 export const reviewCue = createAction('[Script] Review Cue', props<{ id: string; decision: CueDecision }>());
 export const toggleRehearsal = createAction('[Script] Toggle Rehearsal');
 export const setOnline = createAction('[Script] Set Online', props<{ online: boolean }>());
+export const mergeOfflineActions = createAction('[Script] Merge Offline Actions', props<{ targetVersionId: string }>());
+export const retryMergeBatch = createAction('[Script] Retry Merge Batch', props<{ batchId: string }>());
+export const dismissOrphan = createAction('[Script] Dismiss Orphan', props<{ id: string }>());

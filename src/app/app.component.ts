@@ -10,7 +10,8 @@ import { MatToolbarModule } from '@angular/material/toolbar';
 import { Store } from '@ngrx/store';
 import { TranslocoModule } from '@jsverse/transloco';
 import { Subscription } from 'rxjs';
-import { activateVersion, addVersion, reorderLines, reviewCue, reviewLine, setOnline, toggleRehearsal } from './state/script.actions';
+import { activateVersion, addVersion, dismissOrphan, mergeOfflineActions, reorderLines, retryMergeBatch, reviewCue, reviewLine, setOnline, toggleRehearsal } from './state/script.actions';
+import { MergeBatch } from './state/script.merge';
 import { ScriptState, ScriptVersion } from './state/script.reducer';
 
 @Component({
@@ -78,7 +79,39 @@ import { ScriptState, ScriptVersion } from './state/script.reducer';
         </mat-card>
       </section>
 
-      <aside class="offline" *ngIf="!(state$ | async)?.online">网络不可用，当前修改已写入本地缓存；恢复网络后需逐条确认合并。</aside>
+      <section class="merge-panel" *ngIf="(state$ | async) as s">
+        <mat-card>
+          <mat-card-title>离线动作合并</mat-card-title>
+          <div class="merge-row">
+            <span>待合并离线动作 <b>{{ s.offlineQueue.length }}</b> 条</span>
+            <button mat-flat-button color="primary" [disabled]="!s.online || s.offlineQueue.length === 0" (click)="mergeNow()">合并到当前版本</button>
+          </div>
+          <p class="hint" *ngIf="!s.online && s.offlineQueue.length > 0">离线中的修改已逐条记录，恢复网络后可合并进编剧的新版本。</p>
+
+          <div class="batch" *ngFor="let batch of s.mergeBatches">
+            <header>
+              <b>批次 {{ batch.id }}</b>
+              <span>→ {{ versionLabel(s, batch.targetVersionId) }}</span>
+              <span class="chip" [class.done]="batch.status === 'merged'" [class.failed]="batch.status === 'failed'">{{ batchStatusText(batch.status) }}</span>
+              <button mat-button color="primary" *ngIf="batch.status === 'failed'" (click)="retryBatch(batch.id)">重试</button>
+            </header>
+            <p class="error" *ngIf="batch.error">合并中断：{{ batch.error }}（已处理 {{ batch.records.length }}/{{ batch.actions.length }} 条，剩余动作保留在批次中，可重试）</p>
+            <ul>
+              <li *ngFor="let record of batch.records" [class]="'outcome-' + record.outcome">{{ record.detail }}</li>
+            </ul>
+          </div>
+
+          <div class="orphans" *ngIf="s.orphans.length > 0">
+            <b>未处理痕迹（原条目已在新版本中移除）</b>
+            <div class="orphan" *ngFor="let orphan of s.orphans">
+              <span>{{ orphan.note }}<small *ngIf="orphan.snapshotText">「{{ orphan.snapshotText }}」</small></span>
+              <button mat-button (click)="dismissOrphan(orphan.id)">知道了</button>
+            </div>
+          </div>
+        </mat-card>
+      </section>
+
+      <aside class="offline" *ngIf="!(state$ | async)?.online">网络不可用，修改已逐条写入离线队列；恢复网络后可在上方合并进新版本。</aside>
     </main>
   `,
   styles: [`
@@ -97,6 +130,21 @@ import { ScriptState, ScriptVersion } from './state/script.reducer';
     .version-name { padding: 12px; background: #f3f4f6; border-radius: 8px; }
     .diff { display: flex; justify-content: space-between; border-bottom: 1px solid #e5e7eb; padding: 14px 0; }
     .diff.warn b { color: #b45309; }
+    .merge-panel { margin-top: 18px; }
+    .merge-row { display: flex; align-items: center; gap: 16px; }
+    .hint { color: #b45309; }
+    .batch { border-top: 1px solid #e5e7eb; margin-top: 12px; padding-top: 8px; }
+    .batch header { display: flex; align-items: center; gap: 10px; }
+    .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e5e7eb; }
+    .chip.done { background: #dcfce7; color: #15803d; }
+    .chip.failed { background: #fee2e2; color: #b91c1c; }
+    .error { color: #b91c1c; }
+    .batch ul { margin: 8px 0; padding-left: 20px; }
+    .outcome-needsReconfirm { color: #b45309; }
+    .outcome-orphaned { color: #b91c1c; }
+    .orphans { border-top: 1px dashed #e5e7eb; margin-top: 12px; padding-top: 8px; }
+    .orphan { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; }
+    .orphan small { color: #6b7280; margin-left: 6px; }
     .offline { position: fixed; right: 18px; bottom: 18px; padding: 14px 18px; color: #fff; background: #b45309; border-radius: 10px; box-shadow: 0 8px 30px #0003; }
     @media (max-width: 820px) { .workspace { grid-template-columns: 1fr; } .line { align-items: flex-start; } }
   `]
@@ -132,6 +180,18 @@ export class AppComponent implements OnInit, OnDestroy {
   reviewLine(id: string, decision: 'accepted' | 'returned') { this.store.dispatch(reviewLine({ id, decision })); }
   dropLine(event: CdkDragDrop<unknown>) { if (event.previousIndex !== event.currentIndex) this.store.dispatch(reorderLines({ from: event.previousIndex, to: event.currentIndex })); }
   reviewCue(id: string, decision: 'accepted' | 'returned') { this.store.dispatch(reviewCue({ id, decision })); }
+  mergeNow() {
+    const sub = this.state$.subscribe((state) => this.store.dispatch(mergeOfflineActions({ targetVersionId: state.activeVersionId })));
+    sub.unsubscribe();
+  }
+  retryBatch(batchId: string) { this.store.dispatch(retryMergeBatch({ batchId })); }
+  dismissOrphan(id: string) { this.store.dispatch(dismissOrphan({ id })); }
+  versionLabel(state: ScriptState, id: string) {
+    return state.versions.find((version) => version.id === id)?.label ?? id;
+  }
+  batchStatusText(status: MergeBatch['status']) {
+    return status === 'merged' ? '已合并' : status === 'failed' ? '失败待重试' : '合并中';
+  }
   pendingCount(version: ScriptVersion) { return version.lines.filter((item) => item.status === 'pending').length + version.cues.filter((item) => item.status === 'pending').length; }
   createDraft() {
     const id = `v${Date.now().toString().slice(-4)}`;
