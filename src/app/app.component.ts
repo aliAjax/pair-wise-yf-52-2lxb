@@ -9,8 +9,8 @@ import { MatTabsModule } from '@angular/material/tabs';
 import { MatToolbarModule } from '@angular/material/toolbar';
 import { Store } from '@ngrx/store';
 import { TranslocoModule } from '@jsverse/transloco';
-import { Subscription } from 'rxjs';
-import { activateVersion, addVersion, reorderLines, reviewCue, reviewLine, setOnline, toggleRehearsal } from './state/script.actions';
+import { Subscription, take } from 'rxjs';
+import { activateVersion, addVersion, mergeOfflineBatch, reorderLines, reviewCue, reviewLine, setOnline, toggleRehearsal } from './state/script.actions';
 import { ScriptState, ScriptVersion } from './state/script.reducer';
 
 @Component({
@@ -39,6 +39,28 @@ import { ScriptState, ScriptVersion } from './state/script.reducer';
               {{ version.label }} · {{ version.playwright }}
             </button>
             <button mat-flat-button color="primary" (click)="createDraft()">新增导演修订</button>
+            <button mat-flat-button color="accent" (click)="publishNewVersion()">模拟编剧交稿</button>
+          </div>
+        </mat-card>
+      </section>
+
+      <section *ngIf="(state$ | async) as state" class="merge-panel">
+        <mat-card *ngIf="state.online && state.offlineBatches.length" class="merge">
+          <mat-card-title>离线改动合并</mat-card-title>
+          <p>断网期间舞台监督的采纳、退回与顺序调整按批次保留；联网后合并到编剧新版本，被改动的台词需重新确认，被移除的条目留下未处理痕迹。</p>
+          <div *ngFor="let batch of state.offlineBatches" class="batch">
+            <div class="batch-head">
+              <mat-chip [color]="batch.status === 'merged' ? 'accent' : batch.status === 'failed' ? 'warn' : 'primary'" selected>{{ batch.status }}</mat-chip>
+              <span class="batch-meta">{{ batch.actions.length }} 项动作 · 草稿 {{ batch.baseVersionId }}<span *ngIf="batch.targetVersionId"> → {{ batch.targetVersionId }}</span></span>
+              <button mat-button color="primary" *ngIf="batch.status !== 'merged'" (click)="mergeBatch(batch.id)">合并到最新版本</button>
+            </div>
+            <p class="batch-error" *ngIf="batch.status === 'failed'">合并失败（{{ batch.error }}）：批次已保留，可重新合并重试。</p>
+          </div>
+          <div class="traces" *ngIf="state.mergeTraces.length">
+            <h4>合并痕迹</h4>
+            <div *ngFor="let trace of state.mergeTraces" class="trace" [class]="trace.kind">
+              <b>{{ trace.kind }}</b> · {{ trace.itemId }} · {{ trace.detail }}
+            </div>
           </div>
         </mat-card>
       </section>
@@ -78,7 +100,7 @@ import { ScriptState, ScriptVersion } from './state/script.reducer';
         </mat-card>
       </section>
 
-      <aside class="offline" *ngIf="!(state$ | async)?.online">网络不可用，当前修改已写入本地缓存；恢复网络后需逐条确认合并。</aside>
+      <aside class="offline" *ngIf="!(state$ | async)?.online">网络不可用，{{ pendingActionCount((state$ | async)!) }} 项离线修改已写入本地缓存；恢复网络后自动合并，被新版本改动的台词需重新确认。</aside>
     </main>
   `,
   styles: [`
@@ -98,6 +120,17 @@ import { ScriptState, ScriptVersion } from './state/script.reducer';
     .diff { display: flex; justify-content: space-between; border-bottom: 1px solid #e5e7eb; padding: 14px 0; }
     .diff.warn b { color: #b45309; }
     .offline { position: fixed; right: 18px; bottom: 18px; padding: 14px 18px; color: #fff; background: #b45309; border-radius: 10px; box-shadow: 0 8px 30px #0003; }
+    .merge-panel { margin-bottom: 18px; }
+    .batch { padding: 12px 0; border-bottom: 1px solid #e5e7eb; }
+    .batch-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .batch-meta { color: #6b7280; font-size: 13px; }
+    .batch-error { color: #b45309; margin: 8px 0 0; }
+    .traces { margin-top: 12px; }
+    .traces h4 { margin: 8px 0; }
+    .trace { font-size: 13px; padding: 6px 10px; border-radius: 6px; margin-bottom: 4px; }
+    .trace.applied { background: #ecfdf5; color: #065f46; }
+    .trace.reconfirm { background: #fffbeb; color: #92400e; }
+    .trace.unprocessed { background: #fef2f2; color: #991b1b; }
     @media (max-width: 820px) { .workspace { grid-template-columns: 1fr; } .line { align-items: flex-start; } }
   `]
 })
@@ -108,7 +141,10 @@ export class AppComponent implements OnInit, OnDestroy {
     return script.versions.find((item) => item.id === script.activeVersionId) ?? script.versions[0];
   });
   private subscription?: Subscription;
-  private onlineHandler = () => this.store.dispatch(setOnline({ online: navigator.onLine }));
+  private onlineHandler = () => {
+    this.store.dispatch(setOnline({ online: true }));
+    this.autoMerge();
+  };
   private offlineHandler = () => this.store.dispatch(setOnline({ online: false }));
 
   constructor(private readonly store: Store<{ script: ScriptState }>) {}
@@ -128,11 +164,63 @@ export class AppComponent implements OnInit, OnDestroy {
   activate(id: string) { this.store.dispatch(activateVersion({ id })); }
   toggleRehearsal() { this.store.dispatch(toggleRehearsal()); }
   setOnline(online: boolean) { this.store.dispatch(setOnline({ online })); }
-  toggleOnline() { this.state$.subscribe((state) => this.setOnline(!state.online)).unsubscribe(); }
+  toggleOnline() {
+    this.state$.pipe(take(1)).subscribe((state) => {
+      const next = !state.online;
+      this.setOnline(next);
+      if (next) this.autoMerge();
+    });
+  }
   reviewLine(id: string, decision: 'accepted' | 'returned') { this.store.dispatch(reviewLine({ id, decision })); }
-  dropLine(event: CdkDragDrop<unknown>) { if (event.previousIndex !== event.currentIndex) this.store.dispatch(reorderLines({ from: event.previousIndex, to: event.currentIndex })); }
+  dropLine(event: CdkDragDrop<unknown>) {
+    if (event.previousIndex === event.currentIndex) return;
+    this.activeVersion$.pipe(take(1)).subscribe((version) => {
+      const itemId = version.lines[event.previousIndex]?.id;
+      if (itemId) this.store.dispatch(reorderLines({ itemId, from: event.previousIndex, to: event.currentIndex }));
+    });
+  }
   reviewCue(id: string, decision: 'accepted' | 'returned') { this.store.dispatch(reviewCue({ id, decision })); }
   pendingCount(version: ScriptVersion) { return version.lines.filter((item) => item.status === 'pending').length + version.cues.filter((item) => item.status === 'pending').length; }
+  pendingActionCount(state: ScriptState): number {
+    return state.offlineBatches
+      .filter((batch) => batch.status !== 'merged')
+      .reduce((sum, batch) => sum + batch.actions.length, 0);
+  }
+  /** 联网后把所有待合并/失败批次合并到最新版本；批次已合并时 reducer 直接跳过，重复合并不会产生两份记录。 */
+  autoMerge() {
+    this.state$.pipe(take(1)).subscribe((state) => {
+      const target = state.versions[state.versions.length - 1];
+      state.offlineBatches
+        .filter((batch) => batch.status === 'pending' || batch.status === 'failed')
+        .forEach((batch) => this.store.dispatch(mergeOfflineBatch({ batchId: batch.id, targetVersionId: target.id })));
+    });
+  }
+  mergeBatch(batchId: string) {
+    this.state$.pipe(take(1)).subscribe((state) => {
+      const target = state.versions[state.versions.length - 1];
+      this.store.dispatch(mergeOfflineBatch({ batchId, targetVersionId: target.id }));
+    });
+  }
+  /** 模拟编剧在线交稿：基于当前版本生成新版本，首条台词与首条提示被改动，末条台词被移除，并新增一条台词。 */
+  publishNewVersion() {
+    this.activeVersion$.pipe(take(1)).subscribe((base) => {
+      const id = `v${Date.now().toString().slice(-4)}`;
+      const changedLines = base.lines.map((line, index) => index === 0 ? { ...line, text: `${line.text}（编剧修订）`, status: 'pending' as const } : line);
+      const keptLines = changedLines.length > 1 ? changedLines.slice(0, -1) : changedLines;
+      const changedCues = base.cues.map((cue, index) => index === 0 ? { ...cue, text: `${cue.text}（编剧修订）` } : cue);
+      const version: ScriptVersion = {
+        id,
+        label: `编剧交稿 ${id}`,
+        playwright: '林编剧',
+        note: `基于 ${base.label} 的新版本：首条台词与首条提示有改动，末条台词被移除。`,
+        basedOn: base.id,
+        lines: [...keptLines, { id: `${id}-l-new`, role: base.lines[0]?.role ?? '周岚', text: '灯亮之前，我们把没说完的话说完。', status: 'pending' }],
+        cues: changedCues
+      };
+      this.store.dispatch(addVersion({ version }));
+      this.store.dispatch(activateVersion({ id }));
+    });
+  }
   createDraft() {
     const id = `v${Date.now().toString().slice(-4)}`;
     const version: ScriptVersion = {
